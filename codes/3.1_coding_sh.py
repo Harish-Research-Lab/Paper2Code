@@ -1,16 +1,16 @@
-from openai import OpenAI
 import json
 import os
 from tqdm import tqdm
 import sys
 import copy
 from utils import extract_planning, content_to_json, extract_code_from_content, print_response, print_log_cost, load_accumulated_cost, save_accumulated_cost, read_python_files
+from claude_client import ClaudeClient, is_claude_model
 import argparse
 
 parser = argparse.ArgumentParser()
 
 parser.add_argument('--paper_name',type=str)
-parser.add_argument('--gpt_version',type=str, default="o3-mini")
+parser.add_argument('--gpt_version',type=str, default="o3-mini")  # OpenAI model (e.g. o3-mini) or Claude model (e.g. claude-opus-5)
 parser.add_argument('--paper_format',type=str, default="JSON", choices=["JSON", "LaTeX"])
 parser.add_argument('--pdf_json_path', type=str) # json format
 parser.add_argument('--pdf_latex_path', type=str) # latex format
@@ -18,7 +18,6 @@ parser.add_argument('--output_dir',type=str, default="")
 parser.add_argument('--output_repo_dir',type=str, default="")
 
 args    = parser.parse_args()
-client = OpenAI(api_key = os.environ["OPENAI_API_KEY"])
 
 paper_name = args.paper_name
 gpt_version = args.gpt_version
@@ -27,6 +26,13 @@ pdf_json_path = args.pdf_json_path
 pdf_latex_path = args.pdf_latex_path
 output_dir = args.output_dir
 output_repo_dir = args.output_repo_dir
+
+use_claude = is_claude_model(gpt_version)
+if use_claude:
+    claude = ClaudeClient(gpt_version)
+else:
+    from openai import OpenAI
+    client = OpenAI(api_key = os.environ["OPENAI_API_KEY"])
 
 if paper_format == "JSON":
     with open(f'{pdf_json_path}') as f:
@@ -102,19 +108,26 @@ Next, you must write only the "{todo_file_name}".
 
 
 def api_call(msg):
+    """Run one completion and return it as an OpenAI-shaped dict."""
+    if use_claude:
+        # A single one-shot call: there is no shared prefix to reuse later,
+        # so skip the automatic cache breakpoint (writing to the cache costs
+        # 1.25x input and would never be read back).
+        return claude.chat(msg, auto_cache=False)
+
     if "o3-mini" in gpt_version or "o4-mini" in gpt_version:
         completion = client.chat.completions.create(
-            model=gpt_version, 
+            model=gpt_version,
             reasoning_effort="high",
             messages=msg
         )
     else:
         completion = client.chat.completions.create(
-            model=gpt_version, 
+            model=gpt_version,
             messages=msg
         )
-    return completion
-    
+    return json.loads(completion.model_dump_json())
+
 
 artifact_output_dir=f'{output_dir}/coding_artifacts'
 os.makedirs(artifact_output_dir, exist_ok=True)
@@ -143,16 +156,15 @@ for todo_idx, todo_file_name in enumerate(["reproduce.sh"]):
     instruction_msg = get_write_msg(todo_file_name, done_file_lst)
     trajectories.extend(instruction_msg)
 
-    completion = api_call(trajectories)
-    # print(completion.choices[0].message)
-    
+    completion_json = api_call(trajectories)
+    # print(completion_json['choices'][0]['message'])
+
     # response
-    completion_json = json.loads(completion.model_dump_json())
     responses.append(completion_json)
 
     # trajectories
-    message = completion.choices[0].message
-    trajectories.append({'role': message.role, 'content': message.content})
+    message = completion_json['choices'][0]['message']
+    trajectories.append({'role': message['role'], 'content': message['content']})
 
     done_file_lst.append(todo_file_name)
 
@@ -173,9 +185,9 @@ for todo_idx, todo_file_name in enumerate(["reproduce.sh"]):
 
 
     # extract code save 
-    code = extract_code_from_content(message.content)
+    code = extract_code_from_content(message['content'])
     if len(code) == 0:
-        code = message.content 
+        code = message['content']
 
     done_file_dict[todo_file_name] = code
     if save_todo_file_name != todo_file_name:

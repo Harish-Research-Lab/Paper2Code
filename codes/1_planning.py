@@ -1,15 +1,15 @@
-from openai import OpenAI
 import json
 from tqdm import tqdm
 import argparse
 import os
 import sys
 from utils import print_response, print_log_cost, load_accumulated_cost, save_accumulated_cost
+from claude_client import ClaudeClient, is_claude_model, text_block, flatten_messages
 
 parser = argparse.ArgumentParser()
 
 parser.add_argument('--paper_name',type=str)
-parser.add_argument('--gpt_version',type=str)
+parser.add_argument('--gpt_version',type=str)  # OpenAI model (e.g. o3-mini) or Claude model (e.g. claude-opus-5)
 parser.add_argument('--paper_format',type=str, default="JSON", choices=["JSON", "LaTeX"])
 parser.add_argument('--pdf_json_path', type=str) # json format
 parser.add_argument('--pdf_latex_path', type=str) # latex format
@@ -17,14 +17,19 @@ parser.add_argument('--output_dir',type=str, default="")
 
 args    = parser.parse_args()
 
-client = OpenAI(api_key = os.environ["OPENAI_API_KEY"])
-
 paper_name = args.paper_name
 gpt_version = args.gpt_version
 paper_format = args.paper_format
 pdf_json_path = args.pdf_json_path
 pdf_latex_path = args.pdf_latex_path
 output_dir = args.output_dir
+
+use_claude = is_claude_model(gpt_version)
+if use_claude:
+    claude = ClaudeClient(gpt_version)
+else:
+    from openai import OpenAI
+    client = OpenAI(api_key = os.environ["OPENAI_API_KEY"])
 
 
 if paper_format == "JSON":
@@ -213,7 +218,26 @@ training:
 """
     }]
 
+if use_claude:
+    # Split the paper into its own cached block: every later planning turn
+    # (and re-run within the cache TTL) reads it from the prompt cache
+    # instead of re-billing it at the full input rate. The concatenation of
+    # the two blocks is byte-identical to the original single-string prompt.
+    _plan_content = plan_msg[1]['content']
+    _marker = "\n\n## Task\n"
+    _paper_part, _task_part = _plan_content.rsplit(_marker, 1)
+    plan_msg[1]['content'] = [
+        text_block(_paper_part + "\n", cache=True),
+        text_block("\n## Task\n" + _task_part),
+    ]
+
 def api_call(msg, gpt_version):
+    """Run one completion and return it as an OpenAI-shaped dict."""
+    if is_claude_model(gpt_version):
+        # auto_cache extends the cached prefix turn by turn, so each of the
+        # four planning calls only pays full price for its new suffix.
+        return claude.chat(msg)
+
     if "o3-mini" in gpt_version:
         completion = client.chat.completions.create(
             model=gpt_version, 
@@ -226,7 +250,7 @@ def api_call(msg, gpt_version):
             messages=msg
         )
 
-    return completion 
+    return json.loads(completion.model_dump_json())
 
 responses = []
 trajectories = []
@@ -246,10 +270,7 @@ for idx, instruction_msg in enumerate([plan_msg, file_list_msg, task_list_msg, c
 
     trajectories.extend(instruction_msg)
 
-    completion = api_call(trajectories, gpt_version)
-    
-    # response
-    completion_json = json.loads(completion.model_dump_json())
+    completion_json = api_call(trajectories, gpt_version)
 
     # print and logging
     print_response(completion_json)
@@ -259,8 +280,8 @@ for idx, instruction_msg in enumerate([plan_msg, file_list_msg, task_list_msg, c
     responses.append(completion_json)
 
     # trajectories
-    message = completion.choices[0].message
-    trajectories.append({'role': message.role, 'content': message.content})
+    message = completion_json['choices'][0]['message']
+    trajectories.append({'role': message['role'], 'content': message['content']})
 
 
 # save
@@ -271,5 +292,7 @@ os.makedirs(output_dir, exist_ok=True)
 with open(f'{output_dir}/planning_response.json', 'w') as f:
     json.dump(responses, f)
 
+# flatten_messages keeps the on-disk trajectory artifact in the upstream
+# all-string shape (block-style content is an API transport detail).
 with open(f'{output_dir}/planning_trajectories.json', 'w') as f:
-    json.dump(trajectories, f)
+    json.dump(flatten_messages(trajectories), f)

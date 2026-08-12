@@ -1,16 +1,21 @@
-from openai import OpenAI
 import json
 import os
 import sys
 import argparse
 from utils import read_python_files, extract_planning, content_to_json, \
         num_tokens_from_messages, read_all_files, extract_json_from_string, get_now_str, print_log_cost
+from claude_client import ClaudeClient, is_claude_model, text_block
 
-client = OpenAI(api_key = os.environ["OPENAI_API_KEY"])
+def api_call(request_json, msg_claude=None, generated_n=1):
+    """Run the evaluation completion(s) and return an OpenAI-shaped dict."""
+    if is_claude_model(request_json["model"]):
+        # Anthropic has no server-side `n`; ClaudeClient runs the samples
+        # sequentially and returns them as choices[0..n-1]. auto_cache is off
+        # because msg_claude already carries an explicit cache breakpoint.
+        return claude.chat(msg_claude, n=generated_n, auto_cache=False)
 
-def api_call(request_json):
     completion = client.chat.completions.create(**request_json)
-    return completion
+    return json.loads(completion.model_dump_json())
 
 def main(args):
 
@@ -26,6 +31,14 @@ def main(args):
     is_papercoder = True if args.papercoder else False
 
     gold_repo_dir = args.gold_repo_dir
+
+    global claude, client
+    use_claude = is_claude_model(gpt_version)
+    if use_claude:
+        claude = ClaudeClient(gpt_version)
+    else:
+        from openai import OpenAI
+        client = OpenAI(api_key = os.environ["OPENAI_API_KEY"])
 
     # paper
     with open(f'{pdf_json_path}') as f:
@@ -99,21 +112,54 @@ def main(args):
 
     msg = [{"role": "system", "content": cur_prompt}]
 
-    try:
-        num_tokens = num_tokens_from_messages(msg)
-    except Exception as e:
-        print(f"[WARNING] An exception was raised while counting tokens for the target repository of {args.paper_name}.")
-        print(e)
-        print("-"*40)
-        num_tokens = 0
-    
+    msg_claude = None
+    if use_claude:
+        # The Anthropic API needs a leading user turn (ClaudeClient would
+        # demote a system-only message to one anyway) — make it explicit, and
+        # mark the whole prompt as a cache breakpoint so samples 2..n read it
+        # from the prompt cache instead of re-billing the full input.
+        msg_claude = [{"role": "user", "content": [text_block(cur_prompt, cache=True)]}]
 
-    if num_tokens > 128000:
-        print(f"[ERROR] {args.paper_name} more than 128k")
-        sys.exit(0)
-    
+        try:
+            num_tokens = claude.count_tokens(msg_claude)
+        except Exception as e:
+            print(f"[WARNING] An exception was raised while counting tokens for the target repository of {args.paper_name}.")
+            print(e)
+            print("-"*40)
+            num_tokens = 0
 
-    if "o3-mini" in gpt_version:
+        # Per-model context window (1M for claude-opus-5/sonnet-5, 200K for
+        # e.g. claude-haiku-4-5), minus 20% headroom for the completions.
+        token_limit = int(claude.context_limit() * 0.8)
+        if num_tokens > token_limit:
+            print(f"[ERROR] {args.paper_name} more than {token_limit} tokens for {gpt_version}")
+            sys.exit(0)
+    else:
+        try:
+            num_tokens = num_tokens_from_messages(msg)
+        except Exception as e:
+            print(f"[WARNING] An exception was raised while counting tokens for the target repository of {args.paper_name}.")
+            print(e)
+            print("-"*40)
+            num_tokens = 0
+
+
+        if num_tokens > 128000:
+            print(f"[ERROR] {args.paper_name} more than 128k")
+            sys.exit(0)
+
+
+    if use_claude:
+        # Record only — the actual Anthropic request is built inside ClaudeClient.
+        request_json = {
+                "model": gpt_version,
+                "provider": "anthropic",
+                "messages": msg_claude,
+                "n": generated_n,
+                "effort": claude.effort,
+                "max_tokens": claude.max_tokens
+        }
+    elif "o3-mini" in gpt_version:
         if generated_n > 8:
             print(f"[WARNING] o3-mini does not support n > 8. Setting generated_n to 8.")
             generated_n = 8
@@ -135,9 +181,8 @@ def main(args):
                 "n": generated_n # 10
         }
         
-    completion = api_call(request_json)
-    completion_json = json.loads(completion.model_dump_json())
-        
+    completion_json = api_call(request_json, msg_claude, generated_n)
+
     score_key = "score"
     rationale_key = "critique_list"
 
@@ -182,6 +227,11 @@ def main(args):
         all_scores.append(int(score))
         rationales.append(rationale)
         
+
+    if len(all_scores) == 0:
+        print(f"[ERROR] No valid evaluation sample could be parsed for {paper_name}. "
+              f"Please re-run the evaluation.")
+        sys.exit(0)
 
     avg_score = sum(all_scores) / len(all_scores)
 

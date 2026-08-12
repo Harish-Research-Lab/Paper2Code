@@ -1,9 +1,9 @@
-from openai import OpenAI
 import json
 import os
 from tqdm import tqdm
 import sys
 from utils import extract_planning, content_to_json, print_response, print_log_cost, load_accumulated_cost, save_accumulated_cost
+from claude_client import ClaudeClient, is_claude_model, text_block, flatten_messages
 import copy
 
 import argparse
@@ -11,7 +11,7 @@ import argparse
 parser = argparse.ArgumentParser()
 
 parser.add_argument('--paper_name',type=str)
-parser.add_argument('--gpt_version',type=str, default="o3-mini")
+parser.add_argument('--gpt_version',type=str, default="o3-mini")  # OpenAI model (e.g. o3-mini) or Claude model (e.g. claude-opus-5)
 parser.add_argument('--paper_format',type=str, default="JSON", choices=["JSON", "LaTeX"])
 parser.add_argument('--pdf_json_path', type=str) # json format
 parser.add_argument('--pdf_latex_path', type=str) # latex format
@@ -19,15 +19,20 @@ parser.add_argument('--output_dir',type=str, default="")
 
 args    = parser.parse_args()
 
-client = OpenAI(api_key = os.environ["OPENAI_API_KEY"])
-
 paper_name = args.paper_name
 gpt_version = args.gpt_version
 paper_format = args.paper_format
 pdf_json_path = args.pdf_json_path
 pdf_latex_path = args.pdf_latex_path
 output_dir = args.output_dir
-    
+
+use_claude = is_claude_model(gpt_version)
+if use_claude:
+    claude = ClaudeClient(gpt_version)
+else:
+    from openai import OpenAI
+    client = OpenAI(api_key = os.environ["OPENAI_API_KEY"])
+
 if paper_format == "JSON":
     with open(f'{pdf_json_path}') as f:
         paper_content = json.load(f)
@@ -91,13 +96,11 @@ This analysis must align precisely with the paper’s methodology, experimental 
      
 """}]
 
-def get_write_msg(todo_file_name, todo_file_desc):
-    
-    draft_desc = f"Write the logic analysis in '{todo_file_name}', which is intended for '{todo_file_desc}'."
-    if len(todo_file_desc.strip()) == 0:
-        draft_desc = f"Write the logic analysis in '{todo_file_name}'."
-
-    write_msg=[{'role': 'user', "content": f"""## Paper
+# Shared context prefix: paper + plan + design + task + config.yaml. It is
+# byte-identical for every todo file, so on the Claude path it becomes its own
+# cached block (see get_write_msg) and calls 2..N read it from the prompt cache
+# instead of re-billing it at the full input rate.
+write_context_part = f"""## Paper
 {paper_content}
 
 -----
@@ -123,7 +126,15 @@ def get_write_msg(todo_file_name, todo_file_desc):
 ```
 -----
 
-## Instruction
+"""
+
+def get_write_msg(todo_file_name, todo_file_desc):
+
+    draft_desc = f"Write the logic analysis in '{todo_file_name}', which is intended for '{todo_file_desc}'."
+    if len(todo_file_desc.strip()) == 0:
+        draft_desc = f"Write the logic analysis in '{todo_file_name}'."
+
+    write_instruction_part = f"""## Instruction
 Conduct a Logic Analysis to assist in writing the code, based on the paper, the plan, the design, the task and the previously specified configuration file (config.yaml). 
 You DON'T need to provide the actual code yet; focus on a thorough, clear analysis.
 
@@ -131,23 +142,41 @@ You DON'T need to provide the actual code yet; focus on a thorough, clear analys
 
 -----
 
-## Logic Analysis: {todo_file_name}"""}]
+## Logic Analysis: {todo_file_name}"""
+
+    if use_claude:
+        # Block 1 is the stable shared context (cache breakpoint); block 2 is
+        # the per-file instruction. Concatenated they are byte-identical to the
+        # single string the OpenAI path sends.
+        write_content = [text_block(write_context_part, cache=True),
+                         text_block(write_instruction_part)]
+    else:
+        write_content = write_context_part + write_instruction_part
+
+    write_msg=[{'role': 'user', "content": write_content}]
     return write_msg
 
 
 def api_call(msg):
+    """Run one completion and return it as an OpenAI-shaped dict."""
+    if use_claude:
+        # Each todo file is an independent one-shot call, so there is no
+        # growing conversation for auto_cache to extend; the explicit
+        # breakpoint on the shared context block does the caching.
+        return claude.chat(msg, auto_cache=False)
+
     if "o3-mini" in gpt_version:
         completion = client.chat.completions.create(
-            model=gpt_version, 
+            model=gpt_version,
             reasoning_effort="high",
             messages=msg
         )
     else:
         completion = client.chat.completions.create(
-            model=gpt_version, 
+            model=gpt_version,
             messages=msg
         )
-    return completion
+    return json.loads(completion.model_dump_json())
 
 
 artifact_output_dir=f'{output_dir}/analyzing_artifacts'
@@ -170,15 +199,14 @@ for todo_file_name in tqdm(todo_file_lst):
     instruction_msg = get_write_msg(todo_file_name, logic_analysis_dict[todo_file_name])
     trajectories.extend(instruction_msg)
         
-    completion = api_call(trajectories)
-    
+    completion_json = api_call(trajectories)
+
     # response
-    completion_json = json.loads(completion.model_dump_json())
     responses.append(completion_json)
-    
+
     # trajectories
-    message = completion.choices[0].message
-    trajectories.append({'role': message.role, 'content': message.content})
+    message = completion_json['choices'][0]['message']
+    trajectories.append({'role': message['role'], 'content': message['content']})
 
     # print and logging
     print_response(completion_json)
@@ -197,7 +225,9 @@ for todo_file_name in tqdm(todo_file_lst):
     with open(f'{output_dir}/{todo_file_name}_simple_analysis_response.json', 'w') as f:
         json.dump(responses, f)
 
+    # flatten_messages keeps the on-disk trajectory artifact in the upstream
+    # all-string shape (block-style content is an API transport detail).
     with open(f'{output_dir}/{todo_file_name}_simple_analysis_trajectories.json', 'w') as f:
-        json.dump(trajectories, f)
+        json.dump(flatten_messages(trajectories), f)
 
 save_accumulated_cost(f"{output_dir}/accumulated_cost.json", total_accumulated_cost)

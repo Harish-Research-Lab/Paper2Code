@@ -149,7 +149,72 @@ def format_json_data(data):
     return formatted_text
 
 
+# Anthropic pricing (USD per 1M tokens). Cache reads bill at 0.1x the input
+# rate; cache writes bill at 2x the input rate for the 1-hour TTL that
+# claude_client.py requests (the 5-minute TTL would be 1.25x).
+CLAUDE_MODEL_COST = {
+    "claude-mythos-5": {"input": 10.00, "output": 50.00},
+    "claude-fable-5": {"input": 10.00, "output": 50.00},
+    "claude-opus-5": {"input": 5.00, "output": 25.00},
+    "claude-opus-4-8": {"input": 5.00, "output": 25.00},
+    "claude-opus-4-7": {"input": 5.00, "output": 25.00},
+    "claude-opus-4-6": {"input": 5.00, "output": 25.00},
+    "claude-opus-4-5": {"input": 5.00, "output": 25.00},
+    # claude-sonnet-5 has introductory pricing ($2/$10) through 2026-08-31;
+    # the standard rate is used here.
+    "claude-sonnet-5": {"input": 3.00, "output": 15.00},
+    "claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
+    "claude-haiku-4-5": {"input": 1.00, "output": 5.00},
+}
+
+CLAUDE_CACHE_READ_MULTIPLIER = 0.1
+CLAUDE_CACHE_WRITE_MULTIPLIER = 2.0  # 1h-TTL cache writes
+
+
+def cal_cost_claude(response_json, model_name):
+    usage = response_json["usage"]
+    prompt_tokens = usage["prompt_tokens"]
+    completion_tokens = usage["completion_tokens"]
+    cached_tokens = usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)
+    cache_write_tokens = usage.get("cache_creation_input_tokens", 0)
+
+    cost_info = None
+    for known_model, pricing in CLAUDE_MODEL_COST.items():
+        if model_name.startswith(known_model):
+            cost_info = pricing
+            break
+    if cost_info is None:
+        print(f"[WARNING] Unknown Claude model '{model_name}'; "
+              f"using claude-opus-5 pricing for the cost estimate.")
+        cost_info = CLAUDE_MODEL_COST["claude-opus-5"]
+
+    actual_input_tokens = prompt_tokens - cached_tokens - cache_write_tokens
+
+    input_cost = (actual_input_tokens / 1_000_000) * cost_info['input']
+    cached_input_cost = (cached_tokens / 1_000_000) * cost_info['input'] * CLAUDE_CACHE_READ_MULTIPLIER
+    cache_write_cost = (cache_write_tokens / 1_000_000) * cost_info['input'] * CLAUDE_CACHE_WRITE_MULTIPLIER
+    output_cost = (completion_tokens / 1_000_000) * cost_info['output']
+
+    total_cost = input_cost + cached_input_cost + cache_write_cost + output_cost
+
+    return {
+        'model_name': model_name,
+        'actual_input_tokens': actual_input_tokens,
+        'input_cost': input_cost,
+        'cached_tokens': cached_tokens,
+        'cached_input_cost': cached_input_cost,
+        'cache_write_tokens': cache_write_tokens,
+        'cache_write_cost': cache_write_cost,
+        'output_tokens': completion_tokens,
+        'output_cost': output_cost,
+        'total_cost': total_cost,
+    }
+
+
 def cal_cost(response_json, model_name):
+    if model_name.startswith("claude"):
+        return cal_cost_claude(response_json, model_name)
+
     model_cost = {
         # gpt-4.1
         "gpt-4.1": {"input": 2.00, "cached_input": 0.50, "output": 8.00},
@@ -296,6 +361,8 @@ def print_log_cost(completion_json, gpt_version, current_stage, output_dir, tota
     output_lines.append(f"🛠️ Model: {usage_info['model_name']}")
     output_lines.append(f"📥 Input tokens: {usage_info['actual_input_tokens']} (Cost: ${usage_info['input_cost']:.8f})")
     output_lines.append(f"📦 Cached input tokens: {usage_info['cached_tokens']} (Cost: ${usage_info['cached_input_cost']:.8f})")
+    if usage_info.get('cache_write_tokens'):
+        output_lines.append(f"📝 Cache write tokens: {usage_info['cache_write_tokens']} (Cost: ${usage_info['cache_write_cost']:.8f})")
     output_lines.append(f"📤 Output tokens: {usage_info['output_tokens']} (Cost: ${usage_info['output_cost']:.8f})")
     output_lines.append(f"💵 Current total cost: ${current_cost:.8f}")
     output_lines.append(f"🪙 Accumulated total cost so far: ${total_accumulated_cost:.8f}")

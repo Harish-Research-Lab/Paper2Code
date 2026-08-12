@@ -37,6 +37,23 @@ cd scripts
 bash run.sh
 ```
 
+### Using Anthropic Claude API
+- 💵 Estimated cost for using claude-opus-5 ($5/$25 per MTok): roughly $5–$10 for the example paper (a measured planning stage alone was ≈$1.70; most of the cost is output tokens). Prompt caching (see below) keeps the input side down; `claude-sonnet-5` cuts the total roughly in half.
+- The default model is `claude-opus-5`. To trade quality for cost, set `MODEL` in the script to `claude-sonnet-5` (about half the price) or `claude-haiku-4-5` (cheapest — but note its 200K context window can overflow on long papers or repositories with many files; the other two models have 1M).
+- 💡 Prompt caching is used automatically: the repeated paper context within a run is billed at ~10% of the input rate. Cache entries use a 1-hour TTL, so a re-run also benefits if it starts within an hour.
+
+```bash
+pip install anthropic
+
+export ANTHROPIC_API_KEY="<ANTHROPIC_API_KEY>"
+
+cd scripts
+bash run_claude.sh
+```
+
+- To run on the LaTeX source of the paper instead, use `bash run_latex_claude.sh`.
+- Evaluation also supports Claude: pass `--gpt_version claude-opus-5` to `codes/eval.py` with `ANTHROPIC_API_KEY` set (`tiktoken` is not needed on that path).
+
 ### Using Open Source Models with vLLM
 - If you encounter any issues installing vLLM, please refer to the [official vLLM repository](https://github.com/vllm-project/vllm).
 - The default model is `deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct`.
@@ -67,12 +84,14 @@ outputs
 - We recommend using a Python virtual environment before installing dependencies.
 - 📦 Install only what you need:
   - For OpenAI API, install `openai`.
+  - For Anthropic Claude API, install `anthropic`.
   - For open-source models, install `vllm`.
   - If you encounter any issues installing vLLM, please refer to the [official vLLM repository](https://github.com/vllm-project/vllm).
 
 
 ```bash
 pip install openai 
+pip install anthropic
 pip install vllm 
 ```
 
@@ -136,6 +155,27 @@ bash run_latex.sh
 ```
 
 
+#### Using Anthropic Claude API
+- 💵 Estimated cost for using claude-opus-5: roughly $5–$10 for the example paper.
+- The default model is `claude-opus-5`; set `MODEL` inside the script to change it (e.g. `claude-sonnet-5`).
+
+```bash
+# Using the PDF-based JSON format of the paper
+export ANTHROPIC_API_KEY="<ANTHROPIC_API_KEY>"
+
+cd scripts
+bash run_claude.sh
+```
+
+```bash
+# Using the LaTeX source of the paper
+export ANTHROPIC_API_KEY="<ANTHROPIC_API_KEY>"
+
+cd scripts
+bash run_latex_claude.sh
+```
+
+
 #### Using Open Source Models with vLLM
 - The default model is `deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct`.
 
@@ -173,8 +213,16 @@ bash run_latex_llm.sh
 
 ### 🛠️ Environment Setup
 ```bash
+# OpenAI models (the default, e.g. o3-mini)
 pip install tiktoken
 export OPENAI_API_KEY="<OPENAI_API_KEY>"
+```
+
+```bash
+# Or Anthropic Claude models: add --gpt_version claude-opus-5 to the eval
+# command below (tiktoken is not needed on this path)
+pip install anthropic
+export ANTHROPIC_API_KEY="<ANTHROPIC_API_KEY>"
 ```
 
 

@@ -1,4 +1,3 @@
-from openai import OpenAI
 import json
 import os
 from tqdm import tqdm
@@ -6,12 +5,13 @@ import re
 import sys
 import copy
 from utils import extract_planning, content_to_json, extract_code_from_content, print_response, print_log_cost, load_accumulated_cost, save_accumulated_cost
+from claude_client import ClaudeClient, is_claude_model, text_block
 import argparse
 
 parser = argparse.ArgumentParser()
 
 parser.add_argument('--paper_name',type=str)
-parser.add_argument('--gpt_version',type=str, default="o3-mini")
+parser.add_argument('--gpt_version',type=str, default="o3-mini")  # OpenAI model (e.g. o3-mini) or Claude model (e.g. claude-opus-5)
 parser.add_argument('--paper_format',type=str, default="JSON", choices=["JSON", "LaTeX"])
 parser.add_argument('--pdf_json_path', type=str) # json format
 parser.add_argument('--pdf_latex_path', type=str) # latex format
@@ -19,7 +19,6 @@ parser.add_argument('--output_dir',type=str, default="")
 parser.add_argument('--output_repo_dir',type=str, default="")
 
 args    = parser.parse_args()
-client = OpenAI(api_key = os.environ["OPENAI_API_KEY"])
 
 paper_name = args.paper_name
 gpt_version = args.gpt_version
@@ -28,6 +27,14 @@ pdf_json_path = args.pdf_json_path
 pdf_latex_path = args.pdf_latex_path
 output_dir = args.output_dir
 output_repo_dir = args.output_repo_dir
+
+use_claude = is_claude_model(gpt_version)
+if use_claude:
+    claude = ClaudeClient(gpt_version)
+else:
+    from openai import OpenAI
+    client = OpenAI(api_key = os.environ["OPENAI_API_KEY"])
+
 
 if paper_format == "JSON":
     with open(f'{pdf_json_path}') as f:
@@ -61,18 +68,21 @@ The code must strictly align with the paper's methodology, experimental setup, a
 Write code with triple quoto."""}]
 
 def get_write_msg(todo_file_name, detailed_logic_analysis, done_file_lst): 
-    code_files = ""
+    # The prompt is built from three parts. Concatenated they are byte-identical
+    # to the single string this stage has always sent; the Claude path instead
+    # sends them as separate blocks so the stable context and the already
+    # written code files can be served from the prompt cache.
+    code_file_parts = []
     for done_file in done_file_lst:
         if done_file.endswith(".yaml"): continue
-        code_files += f"""
+        code_file_parts.append(f"""
 ```python
 {done_file_dict[done_file]}
 ```
 
-"""
+""")
 
-    write_msg=[
-{'role': 'user', "content": f"""# Context
+    context_part = f"""# Context
 ## Paper
 {paper_content}
 
@@ -100,7 +110,9 @@ def get_write_msg(todo_file_name, detailed_logic_analysis, done_file_lst):
 -----
 
 ## Code Files
-{code_files}
+"""
+
+    instruction_part = f"""
 
 -----
 
@@ -129,11 +141,33 @@ Next, you must write only the "{todo_file_name}".
 
 {detailed_logic_analysis}
 
-## Code: {todo_file_name}"""}]
+## Code: {todo_file_name}"""
+
+    if use_claude:
+        # Two explicit cache breakpoints: the stable context prefix, and the
+        # most recently completed code file. Files are appended in order, so
+        # every iteration re-reads the earlier files from the prompt cache and
+        # only pays full price for the newest file plus the per-file suffix.
+        write_content = [text_block(context_part, cache=True)]
+        for done_idx, code_file_part in enumerate(code_file_parts):
+            write_content.append(text_block(
+                code_file_part, cache=(done_idx == len(code_file_parts) - 1)))
+        write_content.append(text_block(instruction_part))
+    else:
+        write_content = context_part + "".join(code_file_parts) + instruction_part
+
+    write_msg=[
+{'role': 'user', "content": write_content}]
     return write_msg
 
 
 def api_call(msg):
+    """Run one completion and return it as an OpenAI-shaped dict."""
+    if use_claude:
+        # get_write_msg already places the two useful breakpoints; auto_cache
+        # would add a third one on the per-file suffix that is never reused.
+        return claude.chat(msg, auto_cache=False)
+
     if "o3-mini" in gpt_version:
         completion = client.chat.completions.create(
             model=gpt_version, 
@@ -145,8 +179,8 @@ def api_call(msg):
             model=gpt_version, 
             messages=msg
         )
-    return completion
-    
+    return json.loads(completion.model_dump_json())
+
 
 # testing for checking
 detailed_logic_analysis_dict = {}
@@ -179,16 +213,15 @@ for todo_idx, todo_file_name in enumerate(tqdm(todo_file_lst)):
     instruction_msg = get_write_msg(todo_file_name, detailed_logic_analysis_dict[todo_file_name], done_file_lst)
     trajectories.extend(instruction_msg)
 
-    completion = api_call(trajectories)
-    # print(completion.choices[0].message)
-    
+    completion_json = api_call(trajectories)
+    # print(completion_json['choices'][0]['message'])
+
     # response
-    completion_json = json.loads(completion.model_dump_json())
     responses.append(completion_json)
 
     # trajectories
-    message = completion.choices[0].message
-    trajectories.append({'role': message.role, 'content': message.content})
+    message = completion_json['choices'][0]['message']
+    trajectories.append({'role': message['role'], 'content': message['content']})
 
     done_file_lst.append(todo_file_name)
 
@@ -209,9 +242,9 @@ for todo_idx, todo_file_name in enumerate(tqdm(todo_file_lst)):
 
 
     # extract code save 
-    code = extract_code_from_content(message.content)
+    code = extract_code_from_content(message['content'])
     if len(code) == 0:
-        code = message.content 
+        code = message['content']
 
     done_file_dict[todo_file_name] = code
     if save_todo_file_name != todo_file_name:

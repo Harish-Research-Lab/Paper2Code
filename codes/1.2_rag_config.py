@@ -3,7 +3,7 @@ import json
 import sys
 import argparse
 
-from openai import OpenAI
+from claude_client import ClaudeClient, is_claude_model
 
 try:
     from huggingface_hub import HfApi
@@ -27,13 +27,19 @@ def parse_args() -> argparse.Namespace:
         "--gpt_version",
         type=str,
         default="gpt-4.1-mini",
-        help="OpenAI chat model name used for name detection.",
+        help="OpenAI (e.g. gpt-4.1-mini) or Claude (e.g. claude-opus-5) chat model name used for name detection.",
     )
     return parser.parse_args()
 
 
 args = parse_args()
-client = OpenAI(api_key = os.environ["OPENAI_API_KEY"])
+
+use_claude = is_claude_model(args.gpt_version)
+if use_claude:
+    claude = ClaudeClient(args.gpt_version)
+else:
+    from openai import OpenAI
+    client = OpenAI(api_key = os.environ["OPENAI_API_KEY"])
 
 planning_config_path = os.path.join(
     args.output_dir, f"planning_config.yaml"
@@ -43,7 +49,7 @@ if not os.path.exists(planning_config_path):
     sys.exit(1)
 
 # ---------------------------------------------------------
-# 1. Load original config and call OpenAI to detect names
+# 1. Load original config and call the model to detect names
 # ---------------------------------------------------------
 with open(planning_config_path, "r", encoding="utf-8") as f:
     config_yaml = f.read()
@@ -84,12 +90,24 @@ Detect the model name and dataset names in the configuration file so that they c
     },
 ]
 
-response = client.chat.completions.create(
-    model=args.gpt_version,
-    messages=messages,
-)
+def api_call(msg, gpt_version):
+    """Run one completion and return it as an OpenAI-shaped dict."""
+    if is_claude_model(gpt_version):
+        # One short, one-off call: there is no shared prefix to reuse across
+        # calls here, so caching the prompt would only add write overhead.
+        return claude.chat(msg, auto_cache=False)
 
-answer = response.choices[0].message.content.strip()
+    completion = client.chat.completions.create(
+        model=gpt_version,
+        messages=msg,
+    )
+
+    return json.loads(completion.model_dump_json())
+
+
+completion_json = api_call(messages, args.gpt_version)
+
+answer = completion_json['choices'][0]['message']['content'].strip()
 # print("Raw OpenAI answer:", answer)
 
 # Parse the list of names from the model output
@@ -98,7 +116,7 @@ try:
     if not isinstance(detect_lst, list):
         raise ValueError("Parsed value is not a list.")
 except Exception as e:
-    print(f"❌ Failed to parse OpenAI answer as JSON list: {e}", file=sys.stderr)
+    print(f"❌ Failed to parse model answer as JSON list: {e}", file=sys.stderr)
     sys.exit(1)
 
 print("Detected names:", detect_lst)

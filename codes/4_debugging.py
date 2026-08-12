@@ -4,8 +4,8 @@ import argparse
 import re
 import sys
 
-from openai import OpenAI
 from utils import read_python_files, content_to_json, extract_planning
+from claude_client import ClaudeClient, is_claude_model
 
 
 def parse_and_apply_changes(responses, debug_dir, save_num=1):
@@ -101,6 +101,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--output_repo_dir",
+        type=str,
+        required=True,
+        help="Directory of the generated repository to debug.",
+    )
+    parser.add_argument(
         "--paper_name",
         type=str,
         required=True,
@@ -110,7 +116,8 @@ def parse_args() -> argparse.Namespace:
         "--model",
         type=str,
         default="o4-mini",
-        help="OpenAI chat model used for debugging.",
+        # OpenAI model (e.g. o4-mini) or Claude model (e.g. claude-opus-5)
+        help="Model used for debugging: an OpenAI model (e.g. o4-mini) or a Claude model (e.g. claude-opus-5).",
     )
     parser.add_argument(
         "--save_num",
@@ -123,7 +130,30 @@ def parse_args() -> argparse.Namespace:
 
 
 args = parse_args()
-client = OpenAI(api_key = os.environ["OPENAI_API_KEY"])
+
+use_claude = is_claude_model(args.model)
+if use_claude:
+    claude = ClaudeClient(args.model)
+else:
+    from openai import OpenAI
+    client = OpenAI(api_key = os.environ["OPENAI_API_KEY"])
+
+
+def api_call(msg, model):
+    """Run one completion and return it as an OpenAI-shaped dict."""
+    if is_claude_model(model):
+        # Single one-shot call: there is no later turn to reuse the prefix,
+        # so skip the cache write.
+        return claude.chat(msg, auto_cache=False)
+
+    completion = client.chat.completions.create(
+        model=model,
+        messages=msg,
+        reasoning_effort="high",
+    )
+
+    return json.loads(completion.model_dump_json())
+
 
 if not os.path.exists(args.error_file_name):
     raise FileNotFoundError(f"Error file not found: {args.error_file_name}")
@@ -245,13 +275,9 @@ result = model(input_data)
 """,
     },
 ]
-response = client.chat.completions.create(
-    model=args.model,
-    messages=msg,
-    reasoning_effort="high",
-)
+completion_json = api_call(msg, args.model)
 
-answer = response.choices[0].message.content
+answer = completion_json['choices'][0]['message']['content']
 # print("===== RAW MODEL ANSWER =====")
 # print(answer)
 
